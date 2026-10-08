@@ -1,0 +1,69 @@
+name: Kasta feed
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Опубликовать, даже если товаров стало намного меньше (плановое сокращение)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kasta-feed
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Сколько товаров было в прошлом фиде
+        run: |
+          curl -fsS "https://raw.githubusercontent.com/${{ github.repository }}/gh-pages/count.txt" -o prev_count.txt \
+            || echo 0 > prev_count.txt
+          echo "Прошлый фид: $(cat prev_count.txt) товаров"
+
+      - name: Собрать фид из CRM
+        env:
+          CRM_FEED_URL: ${{ secrets.CRM_FEED_URL }}
+          MIN_RATIO: ${{ inputs.force && '0' || '0.7' }}
+        run: |
+          test -n "$CRM_FEED_URL" || { echo "Не задан секрет CRM_FEED_URL"; exit 1; }
+          mkdir -p out
+          python crm_to_kasta.py "$CRM_FEED_URL" out/feed.xml out/report.json \
+            --prev-count "$(cat prev_count.txt)" --min-ratio "$MIN_RATIO"
+
+      - name: Опубликовать feed.xml в gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir site && cp out/feed.xml site/feed.xml
+          python -c "import json;print(json.load(open('out/report.json'))['in_feed'])" > site/count.txt
+          touch site/.nojekyll
+          cd site
+          git init -q -b gh-pages
+          git config user.name  "kasta-feed-bot"
+          git config user.email "kasta-feed-bot@users.noreply.github.com"
+          git add -A
+          git commit -qm "feed $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages
+
+      - name: Отчёт о товарах
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: out/report.json
+          retention-days: 14
+          if-no-files-found: ignore
